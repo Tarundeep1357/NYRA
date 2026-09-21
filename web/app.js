@@ -59,6 +59,9 @@ function renderState() {
   $('#stage').textContent = current.active.agent ? current.active.stage : timer ? `Focus · ${Math.max(0, Math.ceil((timer.due * 1000 - Date.now()) / 60000))} min left` : 'Ready when you are';
   $('#system-state').textContent = current.active.agent ? 'WORKING' : modelConnected && current.settings.model ? 'CONNECTED' : 'STANDBY';
   if (!voiceEnabled) $('#core-state').textContent = current.active.agent ? current.active.stage.toUpperCase() : 'AWAITING YOUR VOICE';
+  const pending = current.pending_action;
+  $('#pending-action').hidden = !pending;
+  if (pending) $('#pending-label').textContent = pending.label;
   renderDetail();
 }
 function taskRow(task, prefix = 'task') {
@@ -103,7 +106,7 @@ async function command(text, fromVoice = false) {
   try {
     const response = await api('/api/command', { command: text.trim() });
     await refresh();
-    if (!fromVoice) openConversation(true);
+    if (!fromVoice && !/Say “OK”/.test(response.content)) openConversation(true);
     if (voiceOutput && (fromVoice || voiceEnabled)) speak(response.content);
   } catch (error) { toast(error.message); $('#command-input').value = text; }
   finally {
@@ -198,9 +201,10 @@ async function refreshModels() {
   $('#model-status').textContent = 'Checking Ollama…';
   try {
     const result = await api('/api/models'); modelConnected = result.connected;
-    $('#model-status').textContent = result.connected ? `${result.models.length} installed model${result.models.length === 1 ? '' : 's'} available.` : result.error;
-    $('#model-select').replaceChildren(new Option(result.models.length ? 'Choose an installed model' : 'No models available', ''));
-    result.models.forEach(model => $('#model-select').add(new Option(model, model)));
+    $('#model-status').textContent = result.connected ? `${result.models.length} model${result.models.length === 1 ? '' : 's'} available.` : result.error;
+    $('#model-provider').textContent = result.models.some(model => model.startsWith('gemini-')) ? 'Ollama + Gemini intelligence' : 'Ollama · local intelligence';
+    $('#model-select').replaceChildren(new Option(result.models.length ? 'Choose an available model' : 'No models available', ''));
+    result.models.forEach(model => $('#model-select').add(new Option(model.startsWith('gemini-') ? `${model} · Gemini API` : `${model} · Ollama`, model)));
     const selected = current?.settings.model || '';
     if (selected && !result.models.includes(selected)) $('#model-select').add(new Option(`${selected} (unavailable)`, selected));
     $('#model-select').value = selected;
@@ -211,6 +215,7 @@ async function refreshModels() {
     $('#agent-status').textContent = ready ? '4 specialists · model connected' : '4 specialists · awaiting model';
   } catch (error) { toast(error.message); }
 }
+$('#confirm-action').addEventListener('click', () => command('OK', false));
 function populateVoices() {
   const select = $('#voice-select'); const desired = safeStore.get('nyra.voice');
   select.replaceChildren(new Option('System default', ''));

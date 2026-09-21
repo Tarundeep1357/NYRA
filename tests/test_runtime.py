@@ -43,6 +43,33 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('connect an installed Ollama model', result['content'])
         self.assertIsNone(server.ACTIVE['agent'])
 
+    def test_laptop_actions_wait_for_ok(self):
+        prepared = server.run_command('Open VS Code')
+        self.assertIn('Say “OK”', prepared['content'])
+        self.assertEqual(server.state()['pending_action']['kind'], 'vscode')
+        with patch.object(server, '_open_vscode', return_value='VS Code is open.') as launch:
+            completed = server.run_command('OK')
+        launch.assert_called_once_with(None)
+        self.assertIn('VS Code is open', completed['content'])
+        self.assertIsNone(server.state()['pending_action'])
+
+    def test_gemini_models_are_offered_only_when_key_is_configured(self):
+        with patch.dict(server.os.environ, {'GEMINI_API_KEY': 'test-key'}), patch.object(server, 'provider', side_effect=OSError):
+            result = server.models()
+        self.assertTrue(result['connected'])
+        self.assertIn('gemini-2.5-flash', result['models'])
+
+    def test_organize_action_moves_files_without_deleting(self):
+        folder = Path(self.temp.name) / 'inbox'
+        folder.mkdir()
+        (folder / 'notes.txt').write_text('hello', encoding='utf-8')
+        server.run_command(f'Organize files in {folder}')
+        with patch.object(server, '_organize_files', wraps=server._organize_files) as organize:
+            result = server.run_command('OK')
+        organize.assert_called_once_with(str(folder))
+        self.assertIn('organized 1 files', result['content'])
+        self.assertTrue((folder / 'txt' / 'notes.txt').is_file())
+
     def test_specialist_review_and_feedback_context(self):
         server.query('UPDATE settings SET value=? WHERE key=?', (json.dumps('test-model'), 'model'))
         server.remember('Use Python')

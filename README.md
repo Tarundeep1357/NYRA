@@ -16,10 +16,29 @@ Open **http://localhost:8765** in Chrome or Edge. Keep the server running for ch
 ## Connect a model
 
 1. Start the installed Ollama application, or run `ollama serve` in another terminal.
-2. Install an Ollama model appropriate for your hardware. Nyra does not automatically download model weights.
+2. Install an Ollama model appropriate for your hardware, for example `ollama pull qwen2.5:3b`. Nyra does not automatically download model weights.
 3. Open **Connections & voice**, click **Refresh**, select the installed model, and save.
 
-The local runtime uses Ollama at `http://127.0.0.1:11434`; cloud models are filtered from the picker. The same chosen model is used by distinct specialist and reviewer roles. Routing is deterministic; general work goes to Researcher, programming to Coder, and planning to Planner. The reviewer is a separate optional inference pass. This version does not run independent autonomous background model agents or parallel model calls.
+Gemini is optional. Set the key in the same PowerShell session before starting Nyra, then refresh the model list:
+
+```powershell
+$env:GEMINI_API_KEY = 'paste-your-key-here'
+python server.py
+```
+
+Nyra offers `gemini-2.5-flash` and `gemini-2.5-flash-lite` when the key is present. The key is read only by the local server and is never stored in SQLite or sent to the browser. Gemini requests send the conversation context to Google; use Ollama if you want inference to remain local.
+
+The local runtime uses Ollama at `http://127.0.0.1:11434`. The same chosen model is used by distinct specialist and reviewer roles. Routing is deterministic; general work goes to Researcher, programming to Coder, and planning to Planner. The reviewer is a separate optional inference pass. This version does not run independent autonomous background model agents or parallel model calls.
+
+## Confirmation-gated laptop actions
+
+Nyra can prepare these actions from voice or text, then waits for an explicit **OK** before executing them:
+
+- `Open VS Code` or `Open VS Code in C:\path\to\project`
+- `Open https://example.com`
+- `Organize files in C:\path\to\folder` (moves files into extension-named subfolders; it does not delete files)
+
+You can say **cancel** instead. For a coding request that includes “open VS Code”, Nyra generates and saves the code first, then asks before opening the generated file in VS Code. Arbitrary shell commands, file deletion, unattended browser clicking, and actions outside these allowlists remain disabled.
 
 ## Voice
 
