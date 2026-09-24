@@ -35,10 +35,19 @@ The local runtime uses Ollama at `http://127.0.0.1:11434`. The same chosen model
 Nyra can prepare these actions from voice or text, then waits for an explicit **OK** before executing them:
 
 - `Open VS Code` or `Open VS Code in C:\path\to\project`
+- `Open project in C:\path\to\project`
+- `Open calculator`, `Open notepad`, or `Open paint`
+- `Open project folder C:\path\to\folder`
 - `Open https://example.com`
 - `Organize files in C:\path\to\folder` (moves files into extension-named subfolders; it does not delete files)
+- `Run project tests in C:\path\to\project`
+- `Write artifact nyra-abc123.py to C:\path\to\project\main.py` (only creates a new file)
 
-You can say **cancel** instead. For a coding request that includes “open VS Code”, Nyra generates and saves the code first, then asks before opening the generated file in VS Code. Arbitrary shell commands, file deletion, unattended browser clicking, and actions outside these allowlists remain disabled.
+You can say **cancel** instead. For a coding request that includes “open VS Code”, Nyra generates and saves the code first, then asks before opening the generated file in VS Code. Actions expire after five minutes. Arbitrary shell commands, file deletion, unattended browser clicking, and actions outside these allowlists remain disabled.
+
+## Automatic voice startup
+
+The first time you click the microphone or core, Nyra shows a voice consent screen. Allow the browser microphone permission and keep **Remember on this device** selected. On later launches Nyra attempts to start voice automatically. Some browsers require one manual click after a restart or when permission has expired; the observatory keeps a Resume voice control available.
 
 ## Voice
 

@@ -5,7 +5,7 @@ const dom = (tag, className, text) => { const e = document.createElement(tag); e
 let sessionToken = '', current = null, busy = false, modelConnected = false;
 let messageSignature = '', taskSignature = '', detailSignature = '', knownMessages = null;
 let toastTimer, selectedAgent = 'planner';
-const safeStore = { get: (key, fallback = '') => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } }, set: (key, value) => { try { localStorage.setItem(key, value); } catch { /* Private mode can block storage. */ } } };
+const safeStore = { get: (key, fallback = '') => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } }, set: (key, value) => { try { localStorage.setItem(key, value); } catch { /* Private mode can block storage. */ } }, remove: key => { try { localStorage.removeItem(key); } catch { /* Private mode can block storage. */ } } };
 let voiceOutput = safeStore.get('nyra.voiceOutput', 'true') === 'true';
 let motionPaused = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -61,7 +61,7 @@ function renderState() {
   if (!voiceEnabled) $('#core-state').textContent = current.active.agent ? current.active.stage.toUpperCase() : 'AWAITING YOUR VOICE';
   const pending = current.pending_action;
   $('#pending-action').hidden = !pending;
-  if (pending) $('#pending-label').textContent = pending.label;
+  if (pending) { $('#pending-label').textContent = pending.label; $('#pending-steps').textContent = `${pending.steps?.join(' · ') || 'Ready to execute'} · Say “OK” or “cancel”.`; }
   renderDetail();
 }
 function taskRow(task, prefix = 'task') {
@@ -244,8 +244,11 @@ $('#save-settings').addEventListener('click', async () => {
 
 // Continuous voice is opt-in. Recognition never runs while Nyra speaks.
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-let recognition = null, voiceEnabled = false, recognizing = false, speaking = false, restartTimer, speechWatchdog;
-function voiceUI(text) { document.body.classList.toggle('is-listening', voiceEnabled); $('#voice-status').textContent = text; $('#mic-button').classList.toggle('listening', voiceEnabled); $('#mic-button').setAttribute('aria-label', voiceEnabled ? 'Stop continuous voice' : 'Enable continuous voice'); $('#core-state').textContent = voiceEnabled ? speaking ? 'SPEAKING TO YOU' : busy ? 'THINKING WITH YOU' : 'LISTENING TO YOU' : 'AWAITING YOUR VOICE'; }
+let recognition = null, voiceEnabled = false, recognizing = false, speaking = false, autoStarting = false, restartTimer, speechWatchdog;
+const voiceConsentKey = 'nyra.voiceConsent.v1';
+function hasVoiceConsent() { return safeStore.get(voiceConsentKey) === 'true'; }
+function updateVoiceArmed() { const armed = hasVoiceConsent(); $('#voice-armed').hidden = !armed; document.body.classList.toggle('auto-voice-armed', armed); }
+function voiceUI(text) { updateVoiceArmed(); document.body.classList.toggle('is-listening', voiceEnabled); $('#voice-status').textContent = text; $('#mic-button').classList.toggle('listening', voiceEnabled); $('#mic-button').setAttribute('aria-label', voiceEnabled ? 'Stop continuous voice' : hasVoiceConsent() ? 'Resume automatic voice' : 'Enable continuous voice'); $('#core-state').textContent = voiceEnabled ? speaking ? 'SPEAKING TO YOU' : busy ? 'THINKING WITH YOU' : 'LISTENING TO YOU' : hasVoiceConsent() ? 'AUTO VOICE ARMED' : 'AWAITING YOUR VOICE'; }
 function stopRecognition() { clearTimeout(restartTimer); if (recognition && recognizing) { try { recognition.abort(); } catch { /* Already stopped. */ } } }
 function scheduleRecognition() { clearTimeout(restartTimer); if (voiceEnabled && !busy && !speaking) restartTimer = setTimeout(startRecognition, 650); }
 function startRecognition() {
@@ -253,12 +256,12 @@ function startRecognition() {
   try { recognition.start(); } catch { scheduleRecognition(); }
 }
 function disableVoice(text = 'Your microphone is off.') { voiceEnabled = false; stopRecognition(); if ('speechSynthesis' in window) speechSynthesis.cancel(); speaking = false; clearTimeout(speechWatchdog); voiceUI(text); }
-function toggleVoice() {
-  if (voiceEnabled) { disableVoice(); return; }
+function beginVoice() {
+  if (voiceEnabled) return;
   if (!Recognition) { toast('Speech recognition is unavailable in this browser. Open Nyra in Chrome or Edge and try again.'); return; }
   if (!recognition) {
     recognition = new Recognition(); recognition.lang = 'en-IN'; recognition.continuous = false; recognition.interimResults = true;
-    recognition.onstart = () => { recognizing = true; voiceUI('Listening · Say your command, or “stop listening” to end voice mode.'); };
+    recognition.onstart = () => { recognizing = true; autoStarting = false; voiceUI('Listening · Say your command, or “stop listening” to end voice mode.'); };
     recognition.onresult = event => {
       let finalText = '', interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) { if (event.results[i].isFinal) finalText += event.results[i][0].transcript; else interim += event.results[i][0].transcript; }
@@ -271,11 +274,17 @@ function toggleVoice() {
     recognition.onend = () => { recognizing = false; scheduleRecognition(); };
     recognition.onerror = event => {
       if (event.error === 'aborted' || event.error === 'no-speech') return;
+      if (autoStarting && (event.error === 'not-allowed' || event.error === 'service-not-allowed')) { autoStarting = false; voiceEnabled = false; voiceUI('Auto voice is armed · click the microphone once to resume.'); return; }
       disableVoice(event.error === 'not-allowed' ? 'Microphone permission was denied. Allow it in browser settings to use voice.' : `Voice stopped (${event.error}). Check microphone and browser connectivity, then try again.`);
       toast($('#voice-status').textContent);
     };
   }
-  voiceEnabled = true; voiceUI('Connecting your microphone…'); startRecognition();
+  voiceEnabled = true; voiceUI(autoStarting ? 'Starting automatic voice…' : 'Connecting your microphone…'); startRecognition();
+}
+function toggleVoice() {
+  if (voiceEnabled) { disableVoice(); return; }
+  if (!hasVoiceConsent()) { $('#voice-consent-dialog').showModal(); return; }
+  beginVoice();
 }
 function speak(text, preview = false) {
   if (!('speechSynthesis' in window)) { if (preview) toast('Speech synthesis is unavailable in this browser.'); return; }
@@ -291,6 +300,7 @@ function speak(text, preview = false) {
   voiceUI('Nyra is speaking…'); speechSynthesis.speak(utterance);
 }
 $('#mic-button').addEventListener('click', toggleVoice); $('#core-button').addEventListener('click', toggleVoice);
+$('#enable-voice').addEventListener('click', () => { if ($('#remember-voice').checked) safeStore.set(voiceConsentKey, 'true'); else safeStore.remove(voiceConsentKey); $('#voice-consent-dialog').close(); autoStarting = false; beginVoice(); });
 $('#test-voice').addEventListener('click', () => speak('Hey, I’m Nyra. Your ideas, your goals, your universe. Let’s make a little more possible.', true));
 function updateOutputToggle() { $('#voice-output').textContent = voiceOutput ? '◖)) Voice on' : '◖)) Voice off'; $('#voice-output').setAttribute('aria-pressed', voiceOutput); }
 $('#voice-output').addEventListener('click', () => { voiceOutput = !voiceOutput; safeStore.set('nyra.voiceOutput', voiceOutput); updateOutputToggle(); if (!voiceOutput && 'speechSynthesis' in window) { speechSynthesis.cancel(); clearTimeout(speechWatchdog); speaking = false; scheduleRecognition(); } });
@@ -328,8 +338,8 @@ document.addEventListener('keydown', event => {
 window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', event => { motionPaused = event.matches; plasma.setPaused(motionPaused); updateMotionButton(); });
 function updateClock() { const date = new Date(); $('#clock').textContent = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); $('#date-label').textContent = date.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }); }
 async function boot() {
-  updateClock(); setInterval(updateClock, 10000); updateOutputToggle(); updateMotionButton(); populateVoices();
-  try { sessionToken = (await api('/api/session')).token; await refresh(); await refreshModels(); } catch { toast('Unable to connect to Nyra. Start the local server and reload.'); }
+  updateClock(); setInterval(updateClock, 10000); updateOutputToggle(); updateMotionButton(); populateVoices(); updateVoiceArmed();
+  try { sessionToken = (await api('/api/session')).token; await refresh(); await refreshModels(); if (hasVoiceConsent() && Recognition) { autoStarting = true; window.setTimeout(beginVoice, 500); } } catch { toast('Unable to connect to Nyra. Start the local server and reload.'); }
   setInterval(refresh, 2200);
 }
 boot();

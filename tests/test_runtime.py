@@ -53,6 +53,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('VS Code is open', completed['content'])
         self.assertIsNone(server.state()['pending_action'])
 
+    def test_pending_action_expires_before_confirmation(self):
+        server.queue_action('app', {'name': 'calculator'}, 'Open calculator')
+        expiry = server.PENDING_ACTION['expires_at']
+        with patch.object(server.time, 'time', return_value=expiry + 1):
+            self.assertIsNone(server.state()['pending_action'])
+            result = server.run_command('OK')
+        self.assertIn('no laptop action', result['content'])
+
     def test_gemini_models_are_offered_only_when_key_is_configured(self):
         with patch.dict(server.os.environ, {'GEMINI_API_KEY': 'test-key'}), patch.object(server, 'provider', side_effect=OSError):
             result = server.models()

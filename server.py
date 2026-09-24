@@ -7,6 +7,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -22,6 +23,18 @@ PORT = int(os.environ.get('NYRA_PORT', '8765'))
 TOKEN = secrets.token_urlsafe(32)
 MODEL_URL = 'http://127.0.0.1:11434'
 GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
+WORKSPACE_ROOT = Path(os.environ.get('NYRA_WORKSPACE_ROOT', ROOT)).resolve()
+ACTION_TTL = 300
+TOOL_REGISTRY = {
+    'open_app': 'Launch one of the Windows allowlisted apps after confirmation.',
+    'open_project': 'Open a selected project in VS Code after confirmation.',
+    'open_vscode': 'Open VS Code or a generated artifact after confirmation.',
+    'write_generated_file': 'Copy a generated artifact without overwriting an existing file.',
+    'open_url': 'Open a validated http or https URL after confirmation.',
+    'organize_folder': 'Move files into extension folders without deleting them.',
+    'run_project_check': 'Run the bounded Python unittest discovery command in a project.',
+    'open_folder': 'Open a selected folder in Windows File Explorer after confirmation.'
+}
 RUN_LOCK = threading.Lock()
 ACTION_LOCK = threading.Lock()
 PENDING_ACTION = None
@@ -154,12 +167,62 @@ def _open_url(url):
     return 'I opened that website in your default browser.'
 
 
-def _organize_files(folder):
+def _safe_folder(folder):
     root = Path(folder).expanduser().resolve()
     if not root.is_dir():
-        raise ValueError('Choose an existing folder to organize.')
-    if root == root.anchor or len(root.parts) < 3:
+        raise ValueError('Choose an existing folder.')
+    if root == Path(root.anchor) or len(root.parts) < 3:
         raise ValueError('Choose a specific folder rather than a drive root.')
+    blocked = {Path(os.environ.get('SystemRoot', r'C:\Windows')).resolve(),
+               Path(os.environ.get('ProgramFiles', r'C:\Program Files')).resolve()}
+    if any(root == item or item in root.parents for item in blocked):
+        raise ValueError('That system folder is protected.')
+    return root
+
+
+def _open_folder(folder):
+    if os.name != 'nt':
+        raise ValueError('Folder actions are available on Windows only.')
+    root = _safe_folder(folder)
+    os.startfile(str(root))
+    event('planner', 'Opened folder: ' + str(root))
+    return f'I opened {root} in File Explorer.'
+
+
+def _run_project_check(folder):
+    root = _safe_folder(folder)
+    tests = root / 'tests'
+    if not tests.is_dir():
+        raise ValueError('I could not find a tests folder in that project.')
+    try:
+        result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'],
+                                cwd=str(root), capture_output=True, text=True, timeout=120, shell=False)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('The project check timed out after two minutes.') from error
+    output = (result.stdout + '\n' + result.stderr).strip()
+    event('coder', f'Project check finished with exit code {result.returncode}')
+    excerpt = output[-2400:] if output else 'No test output was returned.'
+    return f'Project check finished with exit code {result.returncode}.\n\n{excerpt}'
+
+
+def _write_artifact(name, target):
+    artifact = query('SELECT name FROM artifacts WHERE name=?', (name,), one=True)
+    if not artifact:
+        raise ValueError('That generated artifact no longer exists.')
+    destination = Path(target).expanduser().resolve()
+    parent = _safe_folder(destination.parent)
+    if destination.exists():
+        raise ValueError('I will not overwrite an existing file. Choose a new filename.')
+    source = DATA / 'artifacts' / artifact['name']
+    if not source.is_file():
+        raise ValueError('The generated artifact is unavailable.')
+    shutil.copy2(source, destination)
+    event('coder', f'Wrote generated artifact to {destination}')
+    return f'I wrote {name} to {destination}. Existing files were protected.'
+
+
+def _organize_files(folder):
+    root = _safe_folder(folder)
     moved = 0
     for item in root.iterdir():
         if not item.is_file() or item.name.startswith('.'):
@@ -176,10 +239,13 @@ def _organize_files(folder):
     return f'I organized {moved} files into extension folders in {root}.'
 
 
-def queue_action(kind, params, label):
+def queue_action(kind, params, label, steps=None, owner='planner'):
     global PENDING_ACTION
     with ACTION_LOCK:
-        PENDING_ACTION = {'kind': kind, 'params': params, 'label': label, 'created': now()}
+        PENDING_ACTION = {'id': uuid.uuid4().hex[:12], 'kind': kind, 'params': params, 'label': label,
+                          'steps': steps or ['Validate the target', 'Execute the approved adapter', 'Report the result'],
+                          'owner': owner, 'requires_confirmation': True, 'created': now(),
+                          'expires_at': time.time() + ACTION_TTL}
     event('nyra', 'Prepared a confirmation-gated laptop action: ' + label)
 
 
@@ -189,25 +255,42 @@ def clear_action():
         PENDING_ACTION = None
 
 
-def execute_pending():
+def pending_action():
+    global PENDING_ACTION
     with ACTION_LOCK:
-        action = dict(PENDING_ACTION) if PENDING_ACTION else None
-        if action:
-            action['params'] = dict(action['params'])
+        if PENDING_ACTION and time.time() >= PENDING_ACTION.get('expires_at', 0):
+            PENDING_ACTION = None
+        return dict(PENDING_ACTION) if PENDING_ACTION else None
+
+
+def execute_pending():
+    action = pending_action()
+    if action:
+        action['params'] = dict(action['params'])
     if not action:
         return message('assistant', 'There is no laptop action waiting for confirmation.')
     try:
         kind, params = action['kind'], action['params']
         if kind == 'vscode':
             answer = _open_vscode(params.get('path'))
+        elif kind == 'project':
+            answer = _open_vscode(params['path'])
+        elif kind == 'app':
+            answer = launch_app(params['name'])
         elif kind == 'url':
             answer = _open_url(params['url'])
         elif kind == 'organize':
             answer = _organize_files(params['folder'])
+        elif kind == 'folder':
+            answer = _open_folder(params['folder'])
+        elif kind == 'project_check':
+            answer = _run_project_check(params['folder'])
+        elif kind == 'write_artifact':
+            answer = _write_artifact(params['name'], params['target'])
         else:
             raise ValueError('That laptop action is not available.')
         clear_action()
-        return message('assistant', answer, 'planner' if kind != 'vscode' else 'coder')
+        return message('assistant', answer, 'planner' if kind not in ('vscode', 'project', 'project_check', 'write_artifact') else 'coder')
     except (OSError, ValueError) as error:
         clear_action()
         return message('assistant', str(error))
@@ -330,26 +413,52 @@ def run_command(command):
         if re.fullmatch(r'(?:ok|okay|yes|confirm|do it|go ahead)[.! ]*', clean, re.I):
             return execute_pending()
         if re.fullmatch(r'(?:cancel|never mind|stop)[.! ]*', clean, re.I):
-            if PENDING_ACTION:
-                label = PENDING_ACTION['label']
+            action = pending_action()
+            if action:
+                label = action['label']
                 clear_action()
                 return message('assistant', f'Cancelled: {label}.')
             return message('assistant', 'Nothing was waiting to be cancelled.')
         vscode = re.fullmatch(r'(?:open|launch|start) (?:visual studio code|vs code|vscode)(?: (?:in|at|for) (.+))?[.!]?', clean, re.I | re.S)
+        project = re.fullmatch(r'(?:open|launch|start) project(?: in| at| from)?[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
         website = re.fullmatch(r'(?:open|visit|go to) (https?://[^\s<>"\']+)[.!]?', clean, re.I)
         organize = re.fullmatch(r'organize files(?: (?:in|at|inside))?[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
+        folder = re.fullmatch(r'(?:open|show) (?:the )?(?:project )?folder[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
+        check = re.fullmatch(r'(?:run|execute) (?:the )?(?:project )?(?:tests|test suite)(?: (?:in|for))?[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
+        write_artifact = re.fullmatch(r'write artifact[:\s]+([\w.-]+)\s+to\s+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
         if vscode:
             target = vscode.group(1).strip() if vscode.group(1) else None
             queue_action('vscode', {'path': target}, 'Open VS Code' + (f' with {target}' if target else ''))
             return message('assistant', 'I can open VS Code' + (f' with {target}' if target else '') + '. Say “OK” when you want me to execute that laptop action.', 'coder')
+        if project:
+            target = project.group(1).strip()
+            queue_action('project', {'path': target}, f'Open project in VS Code: {target}',
+                         ['Validate the project path', 'Open the project in VS Code'], 'coder')
+            return message('assistant', f'I can open the project at {target} in VS Code. Say “OK” to execute it.', 'coder')
         if website:
             url = website.group(1).rstrip('.,!?')
             queue_action('url', {'url': url}, f'Open {url}')
             return message('assistant', f'I can open {url} in your browser. Say “OK” when you want me to execute that laptop action.', 'planner')
         if organize:
             folder = organize.group(1).strip()
-            queue_action('organize', {'folder': folder}, f'Organize files in {folder}')
+            queue_action('organize', {'folder': folder}, f'Organize files in {folder}',
+                         ['Inspect the selected folder', 'Move files into extension folders', 'Report every move'])
             return message('assistant', f'I can organize files in {folder} into extension folders. Say “OK” to execute it, or “cancel”.', 'planner')
+        if folder:
+            target = folder.group(1).strip()
+            queue_action('folder', {'folder': target}, f'Open folder {target}',
+                         ['Validate the folder', 'Open it in File Explorer'], 'planner')
+            return message('assistant', f'I can open {target} in File Explorer. Say “OK” to execute it.', 'planner')
+        if check:
+            target = check.group(1).strip()
+            queue_action('project_check', {'folder': target}, f'Run tests in {target}',
+                         ['Validate the project tests folder', 'Run Python unittest discovery', 'Show the output'], 'coder')
+            return message('assistant', f'I can run the project tests in {target}. Say “OK” to execute the check.', 'coder')
+        if write_artifact:
+            name, target = write_artifact.group(1), write_artifact.group(2).strip()
+            queue_action('write_artifact', {'name': name, 'target': target}, f'Write {name} to {target}',
+                         ['Validate the generated artifact', 'Protect existing files', 'Write the new file'], 'coder')
+            return message('assistant', f'I can write {name} to {target} without overwriting an existing file. Say “OK” to execute it.', 'coder')
         task = re.fullmatch(r'(?:add (?:a )?task|remind me to)[:\s]+(.+)', clean, re.I | re.S)
         memory = re.fullmatch(r'(?:remember(?: that)?|save memory)[:\s]+(.+)', clean, re.I | re.S)
         done = re.fullmatch(r'(?:complete|finish|mark done) (?:task )?(.+)', clean, re.I | re.S)
@@ -358,7 +467,9 @@ def run_command(command):
         if timer:
             return message('assistant', start_timer(int(timer.group(1)), timer.group(2) or 'Focus session'), 'planner')
         if app:
-            return message('assistant', launch_app(app.group(1).lower()), 'planner')
+            name = app.group(1).lower()
+            queue_action('app', {'name': name}, f'Open {name}', ['Validate the allowlisted app', f'Launch {name}', 'Report the result'])
+            return message('assistant', f'I can open {name}. Say “OK” to execute that laptop action.', 'planner')
         if task:
             add_task(task.group(1))
             return message('assistant', f'Added to your tasks: {task.group(1)}. This is a task entry; it does not have a timed alert.', 'planner')
@@ -377,7 +488,7 @@ def run_command(command):
             return message('assistant', briefing(), 'planner')
         config = settings()
         if not config['model']:
-            return message('assistant', 'I’m ready to manage tasks and memories. For conversation, coding, and problem-solving, connect an installed Ollama model in Connections. Try “add task: plan my week” or “remember that I prefer concise answers”.')
+            return message('assistant', 'I’m ready to manage tasks, memories, and approved laptop actions. For conversation, coding, and problem-solving, connect an installed Ollama model or Gemini in Connections. Try “add task: plan my week” or “remember that I prefer concise answers”.')
         agent = route(clean)
         wants_vscode = bool(re.search(r'\b(?:open|launch|start)\s+(?:visual studio code|vs code|vscode)\b', clean, re.I))
         ACTIVE.update(agent=agent, stage='Working on your request')
@@ -428,7 +539,7 @@ def state():
     return {'tasks': tasks, 'memories': query('SELECT * FROM memories ORDER BY created DESC'),
             'messages': query('SELECT * FROM (SELECT * FROM messages ORDER BY created DESC LIMIT 60) ORDER BY created'),
             'events': query('SELECT * FROM events ORDER BY created DESC LIMIT 30'),
-            'settings': settings(), 'active': dict(ACTIVE), 'pending_action': dict(PENDING_ACTION) if PENDING_ACTION else None,
+            'settings': settings(), 'active': dict(ACTIVE), 'pending_action': pending_action(),
             'feedback_count': query('SELECT count(*) AS n FROM feedback', one=True)['n'],
             'timers': query('SELECT * FROM timers WHERE fired=0 ORDER BY due'),
             'artifacts': query('SELECT * FROM artifacts ORDER BY created DESC LIMIT 30'),
