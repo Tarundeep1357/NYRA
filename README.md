@@ -19,14 +19,18 @@ Open **http://localhost:8765** in Chrome or Edge. Keep the server running for ch
 2. Install an Ollama model appropriate for your hardware, for example `ollama pull qwen2.5:3b`. Nyra does not automatically download model weights.
 3. Open **Connections & voice**, click **Refresh**, select the installed model, and save.
 
-Gemini is optional. Set the key in the same PowerShell session before starting Nyra, then refresh the model list:
+Gemini is optional. Create a key in [Google AI Studio](https://aistudio.google.com/app/apikey), then save it as a **user-level Windows environment variable** before starting Nyra:
 
 ```powershell
-$env:GEMINI_API_KEY = 'paste-your-key-here'
+# Replace the placeholder locally. Do not commit this value or paste it into Nyra chat.
+[Environment]::SetEnvironmentVariable('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY', 'User')
+
+# Start a new PowerShell window so the process receives the new variable.
+cd C:\Users\Lenovo\Documents\Nyra
 python server.py
 ```
 
-Nyra offers `gemini-2.5-flash` and `gemini-2.5-flash-lite` when the key is present. The key is read only by the local server and is never stored in SQLite or sent to the browser. Gemini requests send the conversation context to Google; use Ollama if you want inference to remain local.
+Nyra offers `gemini-2.5-flash` and `gemini-2.5-flash-lite` when the key is present. The key is read only by the local server and is never stored in SQLite, browser storage, Git, or sent to the browser. Gemini requests send the conversation context to Google; use Ollama if you want inference to remain local. If you think the key was exposed, revoke it in Google AI Studio and create a replacement.
 
 The local runtime uses Ollama at `http://127.0.0.1:11434`. The same chosen model is used by distinct specialist and reviewer roles. Routing is deterministic; general work goes to Researcher, programming to Coder, and planning to Planner. The reviewer is a separate optional inference pass. This version does not run independent autonomous background model agents or parallel model calls.
 
