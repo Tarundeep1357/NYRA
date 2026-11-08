@@ -11,10 +11,11 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError, HTTPError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -23,23 +24,47 @@ PORT = int(os.environ.get('NYRA_PORT', '8765'))
 TOKEN = secrets.token_urlsafe(32)
 MODEL_URL = 'http://127.0.0.1:11434'
 GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
+GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
+CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
 WORKSPACE_ROOT = Path(os.environ.get('NYRA_WORKSPACE_ROOT', ROOT)).resolve()
 ACTION_TTL = 300
-TOOL_REGISTRY = {
-    'open_app': 'Launch one of the Windows allowlisted apps after confirmation.',
-    'open_project': 'Open a selected project in VS Code after confirmation.',
-    'open_vscode': 'Open VS Code or a generated artifact after confirmation.',
-    'write_generated_file': 'Copy a generated artifact without overwriting an existing file.',
-    'open_url': 'Open a validated http or https URL after confirmation.',
-    'organize_folder': 'Move files into extension folders without deleting them.',
-    'run_project_check': 'Run the bounded Python unittest discovery command in a project.',
-    'open_folder': 'Open a selected folder in Windows File Explorer after confirmation.'
-}
+LOCAL_RISK = {'low', 'medium', 'high'}  # Anything above "low" requires a spoken or typed OK.
+SENSITIVE_SETTINGS = {'google_refresh_token', 'google_client_secret'}
+GEMINI_PLACEHOLDER = 'AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
 RUN_LOCK = threading.Lock()
 ACTION_LOCK = threading.Lock()
 PENDING_ACTION = None
 ACTIVE = {'agent': None, 'stage': 'Ready', 'emotion': 'steady'}
 DB_LOCK = threading.RLock()
+# One registry for every confirmation-gated tool: local laptop actions and cloud integrations.
+TOOL_REGISTRY = {
+    'vscode': {'description': 'Open VS Code or a generated artifact.', 'risk': 'medium', 'domain': 'local'},
+    'project': {'description': 'Open a project in VS Code.', 'risk': 'medium', 'domain': 'local'},
+    'app': {'description': 'Launch an allowlisted Windows app.', 'risk': 'medium', 'domain': 'local'},
+    'url': {'description': 'Open a validated website in the default browser.', 'risk': 'low', 'domain': 'local'},
+    'organize': {'description': 'Move files into extension folders without deleting them.', 'risk': 'high', 'domain': 'local'},
+    'folder': {'description': 'Open a folder in File Explorer.', 'risk': 'low', 'domain': 'local'},
+    'project_check': {'description': 'Run a project’s Python test suite.', 'risk': 'medium', 'domain': 'local'},
+    'write_artifact': {'description': 'Write a generated artifact without overwriting files.', 'risk': 'high', 'domain': 'local'},
+    'calendar_read': {'description': 'Read upcoming events from your primary Google Calendar.', 'risk': 'low', 'domain': 'cloud'}
+}
+
+# Generic tool adapters. Each adapter validates its own parameters, returns a user-facing string,
+# and never runs until the user has approved the queued action with OK.
+def _tool_calendar_read(params):
+    events = calendar_upcoming(params['count'], params['days'])
+    if not events:
+        return f'I found no events on the calendar in the next {params["days"]} days. Your schedule is clear.'
+    lines = [f'Your next {len(events)} event{"s" if len(events) > 1 else ""} (read-only from Google Calendar):']
+    for item in events:
+        start = item['start'].replace('T', ' ').rstrip('Z')
+        lines.append(f'• {start} — {item["summary"]}')
+    lines.append('Google Calendar was accessed read-only. No events were changed.')
+    return '\n'.join(lines)
+
+
+TOOL_ADAPTERS = {'calendar_read': _tool_calendar_read}
 
 
 def now():
@@ -74,12 +99,18 @@ def initialize():
           CREATE TABLE IF NOT EXISTS timers(id TEXT PRIMARY KEY,title TEXT NOT NULL,due REAL NOT NULL,fired INTEGER DEFAULT 0);
           CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,name TEXT NOT NULL,created TEXT NOT NULL);
         ''')
-    for key, value in {'model': '', 'review': True, 'daily_brief': True, 'brief_hour': 9, 'last_brief': ''}.items():
+    for key, value in {'model': '', 'review': True, 'daily_brief': True, 'brief_hour': 9, 'last_brief': '',
+                       'google_client_id': '', 'google_client_secret': '', 'google_refresh_token': ''}.items():
         query('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, json.dumps(value)))
 
 
 def settings():
     return {row['key']: json.loads(row['value']) for row in query('SELECT * FROM settings')}
+
+
+def public_settings():
+    """Settings safe to send to the browser. OAuth secrets never leave the server."""
+    return {key: value for key, value in settings().items() if key not in SENSITIVE_SETTINGS}
 
 
 def event(agent, content):
@@ -239,14 +270,151 @@ def _organize_files(folder):
     return f'I organized {moved} files into extension folders in {root}.'
 
 
+def _google_credentials():
+    config = settings()
+    client_id = (config.get('google_client_id') or os.environ.get('GOOGLE_CLIENT_ID', '')).strip()
+    client_secret = (config.get('google_client_secret') or os.environ.get('GOOGLE_CLIENT_SECRET', '')).strip()
+    return client_id, client_secret
+
+
+def calendar_status():
+    client_id, client_secret = _google_credentials()
+    connected = bool(settings().get('google_refresh_token'))
+    if connected:
+        return {'connected': True, 'configured': True,
+                'message': 'Google Calendar is connected read-only for upcoming events.'}
+    if client_id and client_secret:
+        return {'connected': False, 'configured': True,
+                'message': 'Click Connect to grant Nyra read-only access to your Google Calendar.'}
+    return {'connected': False, 'configured': False,
+            'message': 'Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (or enter them below), then restart or reconnect.'}
+
+
+def connect_calendar_credentials(client_id, client_secret):
+    """Verify OAuth app credentials with Google, then store them. Refuses real-looking API keys."""
+    client_id = text_field(client_id, 300)
+    client_secret = text_field(client_secret, 300)
+    if len(client_secret) <= 14 and client_secret.startswith('AIza'):
+        raise ValueError('That looks like a Google API key. Use the OAuth client secret from your OAuth client, not an API key.')
+    payload = {'grant_type': 'authorization_code', 'client_id': client_id, 'client_secret': client_secret,
+               'code': 'nyra-connection-check', 'redirect_uri': 'http://localhost'}
+    request = Request(GOOGLE_TOKEN_URL, data=urlencode(payload).encode(),
+                      headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        urlopen(request, timeout=15)
+    except HTTPError as error:
+        try:
+            detail = json.load(error)
+        except ValueError:
+            detail = {}
+        if detail.get('error_description', '').startswith('Invalid authorization code'):
+            pass  # Google validated the client credentials and rejected only the dummy code.
+        elif detail.get('error') == 'invalid_client':
+            raise ValueError('These credentials are not an OAuth client secret. Copy them from Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 Client IDs.') from error
+        else:
+            raise ValueError('Google could not verify these credentials. Check for typos and try again.') from error
+    except (URLError, OSError) as error:
+        raise ValueError('Google could not be reached. Connect to the internet and try again.') from error
+    query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_id', json.dumps(client_id)))
+    query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_secret', json.dumps(client_secret)))
+    event('nyra', 'Saved Google OAuth client credentials')
+    return calendar_status()['message']
+
+
+def calendar_authorize(client_id):
+    """Build the Google authorization URL for Nyra's loopback-redirect OAuth flow (needs the browser)."""
+    if not client_id:
+        raise ValueError('Connect your OAuth client credentials first.')
+    params = {'client_id': client_id, 'redirect_uri': 'http://localhost', 'response_type': 'code',
+              'scope': CALENDAR_SCOPE, 'access_type': 'offline', 'prompt': 'consent'}
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(params)
+
+
+def calendar_exchange(code):
+    """Exchange a one-time authorization code for a refresh token, then store it server-side only."""
+    code = text_field(code, 2000)
+    client_id, client_secret = _google_credentials()
+    if not client_id or not client_secret:
+        raise ValueError('Connect your OAuth client credentials first.')
+    payload = {'grant_type': 'authorization_code', 'client_id': client_id, 'client_secret': client_secret,
+               'code': code, 'redirect_uri': 'http://localhost'}
+    request = Request(GOOGLE_TOKEN_URL, data=urlencode(payload).encode(),
+                      headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        with urlopen(request, timeout=15) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        raise ValueError('Google rejected that authorization code. Start Connect again and paste the fresh code.') from error
+    except (URLError, OSError, ValueError) as error:
+        raise ValueError('Google did not respond. Check your connection and try again.') from error
+    refresh = result.get('refresh_token')
+    if not refresh:
+        raise ValueError('Google did not return a refresh token. Revoke Nyra at myaccount.google.com/permissions and connect again.')
+    query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_refresh_token', json.dumps(refresh)))
+    event('nyra', 'Google Calendar connected read-only')
+    return 'Google Calendar is connected read-only. Say “what’s on my calendar” to try it.'
+
+
+def calendar_access_token():
+    client_id, client_secret = _google_credentials()
+    refresh = settings().get('google_refresh_token')
+    if not (client_id and client_secret and refresh):
+        raise ValueError('Google Calendar is not connected. Connect it in Calendar settings first.')
+    payload = {'grant_type': 'refresh_token', 'client_id': client_id, 'client_secret': client_secret,
+               'refresh_token': refresh}
+    request = Request(GOOGLE_TOKEN_URL, data=urlencode(payload).encode(),
+                      headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.load(response)['access_token']
+    except HTTPError as error:
+        raise ValueError('Google refused the stored access. Reconnect Google Calendar in settings.') from error
+    except (URLError, OSError, KeyError, ValueError) as error:
+        raise ValueError('Google Calendar could not issue an access token. Check your connection.') from error
+
+
+def calendar_upcoming(count, days):
+    token = calendar_access_token()
+    begins = datetime.now(timezone.utc)
+    ends = begins + timedelta(days=days)
+    params = {'timeMin': begins.isoformat(timespec='seconds'), 'timeMax': ends.isoformat(timespec='seconds'),
+              'singleEvents': 'true', 'orderBy': 'startTime', 'maxResults': str(max(1, min(count, 20)))}
+    request = Request(CALENDAR_URL + '?' + urlencode(params),
+                      headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+    try:
+        with urlopen(request, timeout=20) as response:
+            items = json.load(response).get('items', [])
+    except HTTPError as error:
+        raise ValueError(f'Google Calendar returned HTTP {error.code}. Reconnect it in settings if this continues.') from error
+    except (URLError, OSError, ValueError) as error:
+        raise ValueError('Google Calendar did not respond. Check your connection.') from error
+    events = []
+    for item in items:
+        start = item.get('start', {})
+        begin = start.get('dateTime') or start.get('date')
+        if not begin:
+            continue
+        events.append({'summary': (item.get('summary') or 'Untitled event')[:200], 'start': begin})
+    return events
+
+
+def calendar_disconnect():
+    query("UPDATE settings SET value=? WHERE key=?", (json.dumps(''), 'google_refresh_token'))
+    event('nyra', 'Google Calendar disconnected')
+    return 'Google Calendar was disconnected. Revoke access at myaccount.google.com/permissions to remove it fully.'
+
+
 def queue_action(kind, params, label, steps=None, owner='planner'):
     global PENDING_ACTION
+    if kind not in TOOL_REGISTRY:
+        raise ValueError('That tool is not registered.')
+    tool = TOOL_REGISTRY[kind]
     with ACTION_LOCK:
         PENDING_ACTION = {'id': uuid.uuid4().hex[:12], 'kind': kind, 'params': params, 'label': label,
                           'steps': steps or ['Validate the target', 'Execute the approved adapter', 'Report the result'],
-                          'owner': owner, 'requires_confirmation': True, 'created': now(),
-                          'expires_at': time.time() + ACTION_TTL}
-    event('nyra', 'Prepared a confirmation-gated laptop action: ' + label)
+                          'owner': owner, 'requires_confirmation': True, 'risk': tool['risk'],
+                          'domain': tool['domain'], 'created': now(), 'expires_at': time.time() + ACTION_TTL}
+    event('nyra', 'Prepared a confirmation-gated ' + tool['domain'] + ' action: ' + label)
 
 
 def clear_action():
@@ -271,28 +439,41 @@ def execute_pending():
         return message('assistant', 'There is no laptop action waiting for confirmation.')
     try:
         kind, params = action['kind'], action['params']
-        if kind == 'vscode':
+        if kind in TOOL_ADAPTERS:
+            answer = TOOL_ADAPTERS[kind](params)
+            owner = 'planner'
+        elif kind == 'vscode':
             answer = _open_vscode(params.get('path'))
+            owner = 'coder'
         elif kind == 'project':
             answer = _open_vscode(params['path'])
+            owner = 'coder'
         elif kind == 'app':
             answer = launch_app(params['name'])
+            owner = 'planner'
         elif kind == 'url':
             answer = _open_url(params['url'])
+            owner = 'planner'
         elif kind == 'organize':
             answer = _organize_files(params['folder'])
+            owner = 'planner'
         elif kind == 'folder':
             answer = _open_folder(params['folder'])
+            owner = 'planner'
         elif kind == 'project_check':
             answer = _run_project_check(params['folder'])
+            owner = 'coder'
         elif kind == 'write_artifact':
             answer = _write_artifact(params['name'], params['target'])
+            owner = 'coder'
         else:
             raise ValueError('That laptop action is not available.')
         clear_action()
-        return message('assistant', answer, 'planner' if kind not in ('vscode', 'project', 'project_check', 'write_artifact') else 'coder')
+        event('nyra', f'Executed approved {TOOL_REGISTRY[kind]["domain"]} action: {action["label"]}')
+        return message('assistant', answer, owner)
     except (OSError, ValueError) as error:
         clear_action()
+        event('nyra', f'Approved action failed: {action["label"]} — {error}')
         return message('assistant', str(error))
 
 
@@ -331,7 +512,10 @@ def briefing():
     if not tasks:
         return 'Your task list is clear. Tell me one thing you want to move forward today, and I can help break it into a first step.'
     titles = '\n'.join(f'{i + 1}. {task["title"]}' for i, task in enumerate(tasks[:10]))
-    return f'You have {len(tasks)} open tasks. Here is your current list:\n\n{titles}\n\nMy suggestion: choose the most important one and protect 25 minutes for it.'
+    suggestion = 'My suggestion: choose the most important one and protect 25 minutes for it.'
+    if calendar_status()['connected']:
+        suggestion += ' You can also say “what’s on my calendar” to check your next few events first.'
+    return f'You have {len(tasks)} open tasks. Here is your current list:\n\n{titles}\n\n{suggestion}'
 
 
 def provider(path, payload=None, timeout=4):
@@ -426,6 +610,30 @@ def run_command(command):
         folder = re.fullmatch(r'(?:open|show) (?:the )?(?:project )?folder[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
         check = re.fullmatch(r'(?:run|execute) (?:the )?(?:project )?(?:tests|test suite)(?: (?:in|for))?[:\s]+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
         write_artifact = re.fullmatch(r'write artifact[:\s]+([\w.-]+)\s+to\s+["\']?(.+?)["\']?[.!]?', clean, re.I | re.S)
+        calendar = re.fullmatch(r'(?:what(?:’s|’s| is| are)? (?:on|in) my (?:google )?calendar|(?:show|check|read|list|view)(?: me)? my (?:google )?calendar|my (?:google )?calendar|(?:upcoming|next) (?:calendar )?events?)[.!?]?', clean, re.I)
+        connect_calendar = re.fullmatch(r'connect(?: my)? google calendar(?: using (\S+) and (\S+))?[.!]?', clean, re.I)
+        finish = re.fullmatch(r'finish (?:google )?calendar (?:connection|setup)(?: with| using)?(?: code)?[:\s]+([\w/_.-]+)[.!]?', clean, re.I)
+        disconnect_calendar = re.fullmatch(r'disconnect(?: my)? google calendar[.!]?', clean, re.I)
+        if calendar:
+            if not calendar_status()['connected']:
+                return message('assistant', 'Google Calendar is not connected yet. In Connections, use Google Calendar → Connect and paste the authorization code Google gives you.', 'planner')
+            queue_action('calendar_read', {'count': 5, 'days': 7}, 'Read your next 5 Google Calendar events (read-only)',
+                         ['Check read-only Google access', 'Fetch upcoming events', 'Summarize without changing anything'], 'planner')
+            return message('assistant', 'I can read your next few Google Calendar events (read-only, no changes). Say “OK” to fetch them.', 'planner')
+        if connect_calendar:
+            if connect_calendar.group(1):
+                try:
+                    return message('assistant', connect_calendar_credentials(connect_calendar.group(1), connect_calendar.group(2)), 'planner')
+                except ValueError as error:
+                    return message('assistant', str(error), 'planner')
+            return message('assistant', 'Open Connections → Google Calendar to enter your OAuth client ID and secret, then click Connect. I never show secrets in chat.', 'planner')
+        if finish:
+            try:
+                return message('assistant', calendar_exchange(finish.group(1)), 'planner')
+            except ValueError as error:
+                return message('assistant', str(error), 'planner')
+        if disconnect_calendar:
+            return message('assistant', calendar_disconnect(), 'planner')
         if vscode:
             target = vscode.group(1).strip() if vscode.group(1) else None
             queue_action('vscode', {'path': target}, 'Open VS Code' + (f' with {target}' if target else ''))
@@ -539,7 +747,9 @@ def state():
     return {'tasks': tasks, 'memories': query('SELECT * FROM memories ORDER BY created DESC'),
             'messages': query('SELECT * FROM (SELECT * FROM messages ORDER BY created DESC LIMIT 60) ORDER BY created'),
             'events': query('SELECT * FROM events ORDER BY created DESC LIMIT 30'),
-            'settings': settings(), 'active': dict(ACTIVE), 'pending_action': pending_action(),
+            'settings': public_settings(), 'active': dict(ACTIVE), 'pending_action': pending_action(),
+            'tools': {kind: tool['description'] for kind, tool in TOOL_REGISTRY.items()},
+            'calendar': calendar_status(),
             'feedback_count': query('SELECT count(*) AS n FROM feedback', one=True)['n'],
             'timers': query('SELECT * FROM timers WHERE fired=0 ORDER BY due'),
             'artifacts': query('SELECT * FROM artifacts ORDER BY created DESC LIMIT 30'),
@@ -635,6 +845,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Expected an object.')
             if self.path == '/api/command':
                 return self.send(run_command(data.get('command')))
+            if self.path == '/api/calendar/connect':
+                result = connect_calendar_credentials(data.get('client_id'), data.get('client_secret'))
+                return self.send({'ok': True, 'status': calendar_status(), 'message': result})
+            if self.path == '/api/calendar/authorize':
+                return self.send({'url': calendar_authorize(settings().get('google_client_id', ''))})
+            if self.path == '/api/calendar/exchange':
+                return self.send({'ok': True, 'message': calendar_exchange(data.get('code'))})
+            if self.path == '/api/calendar/disconnect':
+                return self.send({'ok': True, 'message': calendar_disconnect()})
             if self.path == '/api/tasks':
                 add_task(data.get('title'))
             elif self.path == '/api/task':

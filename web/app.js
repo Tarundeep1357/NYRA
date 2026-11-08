@@ -230,8 +230,40 @@ async function openSettings() {
   $('#settings-dialog').showModal();
   if (current) { $('#review-toggle').checked = current.settings.review; $('#daily-toggle').checked = current.settings.daily_brief; $('#brief-hour').value = current.settings.brief_hour; }
   $('#voice-pitch').value = safeStore.get('nyra.pitch', '1.05'); $('#pitch-value').textContent = $('#voice-pitch').value;
-  populateVoices(); await refreshModels();
+  populateVoices(); renderCalendar(); await refreshModels();
 }
+function renderCalendar() {
+  const calendar = current?.calendar;
+  if (!calendar) return;
+  $('#calendar-state').textContent = calendar.connected ? 'Connected · read-only' : calendar.configured ? 'Ready to connect' : 'Not configured';
+  $('#calendar-state').classList.toggle('connected', calendar.connected);
+  $('#calendar-message').textContent = calendar.message;
+  $('#calendar-setup').hidden = calendar.connected;
+  $('#calendar-oauth').hidden = !calendar.configured || calendar.connected;
+  $('#calendar-disconnect').hidden = !calendar.connected;
+}
+$('#calendar-connect').addEventListener('click', async () => {
+  const button = $('#calendar-connect'); button.disabled = true;
+  try {
+    const result = await api('/api/calendar/connect', { client_id: $('#calendar-client-id').value, client_secret: $('#calendar-client-secret').value });
+    $('#calendar-client-secret').value = ''; toast(result.message); await refresh(); renderCalendar();
+  } catch (error) { toast(error.message); }
+  button.disabled = false;
+});
+$('#calendar-authorize').addEventListener('click', async () => {
+  try { const result = await api('/api/calendar/authorize', {}); window.open(result.url, '_blank', 'noopener'); toast('Approve read-only access in the new tab, then paste the code Google gives you.'); }
+  catch (error) { toast(error.message); }
+});
+$('#calendar-exchange').addEventListener('click', async () => {
+  const button = $('#calendar-exchange'); button.disabled = true;
+  try { const result = await api('/api/calendar/exchange', { code: $('#calendar-code').value }); $('#calendar-code').value = ''; toast(result.message); await refresh(); renderCalendar(); }
+  catch (error) { toast(error.message); }
+  button.disabled = false;
+});
+$('#calendar-disconnect').addEventListener('click', async () => {
+  try { const result = await api('/api/calendar/disconnect', {}); toast(result.message); await refresh(); renderCalendar(); }
+  catch (error) { toast(error.message); }
+});
 $$('[data-open=settings]').forEach(button => button.addEventListener('click', openSettings));
 $('#refresh-models').addEventListener('click', refreshModels);
 $('#voice-pitch').addEventListener('input', () => { $('#pitch-value').textContent = $('#voice-pitch').value; });

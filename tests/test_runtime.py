@@ -159,8 +159,58 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cloud_models_are_not_offered_as_local(self):
         with patch.object(server, 'provider', return_value={'models': [
-                {'name': 'local:3b'}, {'name': 'remote:cloud', 'remote_host': 'https://ollama.com'}, {'name': 'another-cloud'}]}):
+                {'name': 'local:3b'}, {'name': 'remote:cloud', 'remote_host': 'https://ollama.com'}, {'name': 'another-cloud'}]}), \
+                patch.dict(server.os.environ, {'GEMINI_API_KEY': ''}):
             self.assertEqual(server.models()['models'], ['local:3b'])
+
+
+    def test_unknown_tool_cannot_be_queued(self):
+        with self.assertRaises(ValueError):
+            server.queue_action('shell', {'command': 'rm -rf /'}, 'Dangerous action')
+        self.assertIsNone(server.state()['pending_action'])
+
+    def test_calendar_request_needs_ok_and_reads_read_only(self):
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_id', json.dumps('id.apps.googleusercontent.com')))
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_secret', json.dumps('ghs-secret')))
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_refresh_token', json.dumps('refresh-1')))
+        prepared = server.run_command('What’s on my calendar?')
+        self.assertIn('Say “OK”', prepared['content'])
+        pending = server.state()['pending_action']
+        self.assertEqual(pending['kind'], 'calendar_read')
+        self.assertEqual(pending['domain'], 'cloud')
+        events = [{'summary': 'Standup', 'start': '2026-11-09T09:30:00Z'}]
+        with patch.object(server, 'calendar_upcoming', return_value=events) as read:
+            completed = server.run_command('OK')
+        read.assert_called_once_with(5, 7)
+        self.assertIn('Standup', completed['content'])
+        self.assertIn('read-only', completed['content'])
+        self.assertIsNone(server.state()['pending_action'])
+
+    def test_calendar_is_refused_without_ok(self):
+        with patch.object(server, '_tool_calendar_read') as read:
+            answer = server.run_command('Show my calendar')
+        read.assert_not_called()
+        self.assertIn('not connected', answer['content'])
+
+    def test_secrets_never_reach_public_state(self):
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_secret', json.dumps('top-secret')))
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_refresh_token', json.dumps('refresh-secret')))
+        state = server.state()
+        self.assertNotIn('google_client_secret', state['settings'])
+        self.assertNotIn('google_refresh_token', state['settings'])
+        self.assertNotIn('top-secret', json.dumps(state))
+
+    def test_api_key_is_rejected_as_oauth_secret(self):
+        with self.assertRaises(ValueError):
+            server.connect_calendar_credentials('id.apps.googleusercontent.com', 'AIzaSyExampleKey1234567890')
+        self.assertEqual(server.settings()['google_client_secret'], '')
+
+    def test_calendar_authorize_url_is_read_only(self):
+        server.query('INSERT OR REPLACE INTO settings VALUES (?,?)', ('google_client_id', json.dumps('id.apps.googleusercontent.com')))
+        url = server.calendar_authorize(server.settings()['google_client_id'])
+        self.assertTrue(url.startswith('https://accounts.google.com/o/oauth2/v2/auth?'))
+        self.assertIn('calendar.readonly', url)
+        self.assertIn('redirect_uri=http%3A%2F%2Flocalhost', url)
 
 
 if __name__ == '__main__':

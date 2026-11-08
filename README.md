@@ -2,7 +2,7 @@
 
 Nyra is a local, voice-first desktop assistant for Windows that runs from your own machine. You speak or type a request, Nyra routes it to a specialist agent (Researcher, Coder, or Planner), and the answer streams back into a live plasma observatory UI. Every action that touches your laptop is shown before it runs and waits for an explicit **OK**.
 
-Think of Nyra as a personal assistant that can *do* things, not only chat: it can generate and save code, open VS Code on a project, open validated websites and built-in apps, organize folders, run a project's test suite, keep tasks and memories, and run daily check-ins. Calendar, Gmail, and VS Code are being layered in as permission-gated integrations (see [Roadmap](#roadmap)).
+Think of Nyra as a personal assistant that can *do* things, not only chat: it can generate and save code, open VS Code on a project, open validated websites and built-in apps, organize folders, run a project's test suite, keep tasks and memories, and run daily check-ins. Calendar, Gmail, and VS Code are being layered in as permission-gated integrations (see [Roadmap](#roadmap)). Google Calendar read-only access is available today.
 
 ## Why Nyra
 
@@ -66,6 +66,27 @@ The local runtime uses Ollama at `http://127.0.0.1:11434`. The chosen model serv
 
 Say **cancel** to decline. Arbitrary shell commands, file deletion, unattended browser clicking, and paths outside the allowlists stay disabled.
 
+## How the permission gate works
+
+Every action-capable capability is a registered **tool** in `TOOL_REGISTRY` (`server.py`) with a risk level and a domain (`local` or `cloud`). When you ask for one, Nyra:
+
+1. **Queues** the action with validated parameters instead of running it.
+2. **Asks** you in a card: “I can read your next 5 calendar events (read-only). Say OK to fetch them.”
+3. **Executes only after you say or type OK**, and logs the outcome to Activity.
+4. **Expires** the action after five minutes if you do nothing.
+
+To add a new capability (Gmail, VS Code edits, another app), register a tool and add an adapter that validates its own inputs — the permission flow is already in place.
+
+## Google Calendar (read-only)
+
+Nyra can read your next few events and summarize them, but **never changes your calendar** in this version. To connect:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an **OAuth client** of type *Web application* and add `http://localhost` as an Authorized redirect URI. Enable the **Google Calendar API**.
+2. Open Nyra **Connections → Google Calendar** and paste the OAuth **client ID** and **client secret**, then click **Save credentials**. (Or set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` environment variables.)
+3. Click **Open Google consent**, approve *read-only* Calendar access, then paste the code Google shows you into Nyra and click **Finish connection**.
+
+The client secret and refresh token are stored only on your computer, never sent to the browser, SQLite exports, or Git. Ask **“What’s on my calendar?”** and confirm with **OK**. **Disconnect** revokes Nyra locally; to remove access fully, visit [Google account permissions](https://myaccount.google.com/permissions).
+
 ## Observing and personalizing
 
 - **Plasma observatory** — drag to turn, scroll to zoom, arrow keys to nudge, **B** for a burst, Escape to exit immersive mode. Reduced-motion settings pause the animation automatically.
@@ -86,7 +107,7 @@ Say **cancel** to decline. Arbitrary shell commands, file deletion, unattended b
 
 Nyra is a working foundation, not yet a fully autonomous desktop agent. The next layers are being added as explicit, narrow tool adapters behind the same **“OK” permission gate**:
 
-- **Calendar** — read and create events (Google Calendar via OAuth).
+- **Calendar** — read-only upcoming events are live now (Google Calendar via OAuth); creating events is next.
 - **Gmail** — draft, summarize, and send mail (Google OAuth, drafts first).
 - **VS Code** — open projects, apply generated files, and run project tests from the editor.
 - **Other apps and platforms** — additional allowlisted integrations, each with an explicit permission prompt.
