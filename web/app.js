@@ -25,7 +25,9 @@ function renderState() {
     const alerts = current.messages.filter(message => !knownMessages.has(message.id) && message.role === 'assistant' && /^(Timer finished:|Your daily check-in)/.test(message.content));
     if (alerts.length) { const text = alerts[alerts.length - 1].content; toast(text.slice(0, 180)); if (voiceEnabled && voiceOutput && !busy && !speaking) speak(text); }
   }
+  const wasStreaming = knownMessages !== null && current.messages.length > knownMessages.size && !busy;
   knownMessages = new Set(current.messages.map(message => message.id));
+  if (wasStreaming) { messageSignature = ''; if (!busy) stopTyping(); }
   const tasks = current.tasks, completed = tasks.filter(task => task.done).length;
   $('#task-count').textContent = tasks.length - completed;
   $('#task-progress').textContent = `${completed} complete`;
@@ -61,9 +63,23 @@ function renderState() {
   if (!voiceEnabled) $('#core-state').textContent = current.active.agent ? current.active.stage.toUpperCase() : 'AWAITING YOUR VOICE';
   const pending = current.pending_action;
   $('#pending-action').hidden = !pending;
-  if (pending) { $('#pending-label').textContent = pending.label; $('#pending-steps').textContent = `${pending.steps?.join(' · ') || 'Ready to execute'} · Say “OK” or “cancel”.`; }
+  if (pending) {
+    const risk = pending.risk ? `${(pending.domain || 'local').toUpperCase()} · ${pending.risk.toUpperCase()} RISK` : '';
+    $('#pending-label').textContent = pending.label;
+    $('#pending-steps').textContent = `${risk ? risk + ' · ' : ''}${pending.steps?.join(' · ') || 'Ready to execute'} · Say “OK” or “cancel”.`;
+  }
   renderDetail();
 }
+
+// Thinking indicator: the synchronous command call takes a while, so show progress as soon as the server reports work.
+let typingTimer;
+function startTyping() {
+  clearInterval(typingTimer);
+  $('#typing').hidden = false;
+  const tick = () => { $('#typing-label').textContent = current?.active?.agent && !busy ? `${(current.active.stage || 'Working').toUpperCase()}…` : 'Nyra is thinking…'; };
+  tick(); typingTimer = setInterval(tick, 700);
+}
+function stopTyping() { clearInterval(typingTimer); $('#typing').hidden = true; $('#typing-label').textContent = 'Nyra is thinking…'; }
 function taskRow(task, prefix = 'task') {
   const row = dom('div', 'task' + (task.done ? ' done' : ''));
   const checkbox = dom('input'); checkbox.type = 'checkbox'; checkbox.id = `${prefix}-${task.id}`; checkbox.checked = !!task.done;
@@ -98,10 +114,14 @@ function messageNode(message) {
   return article;
 }
 async function command(text, fromVoice = false) {
-  if (!text.trim() || busy) return;
+  if (!text.trim()) return;
+  if (busy) { toast('Nyra is still working on your previous request.'); return; }
   busy = true;
+  startTyping();
   stopRecognition();
-  $('#send-button').disabled = true; $('#command-input').disabled = true; $('#command-input').value = '';
+  // Keep the input usable but block a second submit with the button until this request finishes.
+  $('#send-button').disabled = true;
+  $('#command-input').value = '';
   $('#core-state').textContent = 'CONNECTING THE DOTS'; $('#stage').textContent = 'Routing your command';
   try {
     const response = await api('/api/command', { command: text.trim() });
@@ -111,6 +131,7 @@ async function command(text, fromVoice = false) {
   } catch (error) { toast(error.message); $('#command-input').value = text; }
   finally {
     busy = false;
+    stopTyping();
     $('#send-button').disabled = false; $('#command-input').disabled = false;
     if (voiceEnabled && !speaking) scheduleRecognition();
   }
@@ -164,6 +185,7 @@ function syncDrawers() {
   const open = !$('#conversation-panel').hidden || !$('#detail-section').hidden;
   $('#drawer-scrim').hidden = !open;
   $('.topbar').inert = open; $('#observatory').inert = open;
+  document.body.classList.toggle('drawer-open', open);
 }
 function openConversation(open) {
   if (open) { history.replaceState(null, '', '#overview'); $('#detail-section').hidden = true; }
@@ -178,6 +200,11 @@ $('#conversation-toggle').addEventListener('click', () => openConversation($('#c
 $('#close-conversation').addEventListener('click', () => openConversation(false));
 $('#back-to-command').addEventListener('click', () => openConversation(false));
 $('#drawer-scrim').addEventListener('click', closeDrawers);
+// Clicking any nav item, including "Observatory", always closes open drawers.
+$$('.nav-item[data-view]').forEach(item => item.addEventListener('click', () => {
+  if (item.dataset.view === 'overview') closeDrawers();
+  else { $('#conversation-panel').hidden = true; $('#conversation-toggle').setAttribute('aria-expanded', 'false'); }
+}));
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && !document.querySelector('dialog[open]') && !$('#drawer-scrim').hidden) closeDrawers();
   if (event.key !== 'Tab' || $('#drawer-scrim').hidden || document.querySelector('dialog[open]')) return;
@@ -238,9 +265,13 @@ function renderCalendar() {
   $('#calendar-state').textContent = calendar.connected ? 'Connected · read-only' : calendar.configured ? 'Ready to connect' : 'Not configured';
   $('#calendar-state').classList.toggle('connected', calendar.connected);
   $('#calendar-message').textContent = calendar.message;
-  $('#calendar-setup').hidden = calendar.connected;
+  $('#calendar-setup').hidden = calendar.connected || calendar.configured;
   $('#calendar-oauth').hidden = !calendar.configured || calendar.connected;
   $('#calendar-disconnect').hidden = !calendar.connected;
+  // Show only the correct call to action: (not configured) setup -> (configured) OAuth -> (connected) disconnect.
+  $('#calendar-authorize').hidden = !calendar.configured || calendar.connected;
+  $('#calendar-exchange').hidden = !calendar.configured || calendar.connected;
+  $('#calendar-code').hidden = !calendar.configured || calendar.connected;
 }
 $('#calendar-connect').addEventListener('click', async () => {
   const button = $('#calendar-connect'); button.disabled = true;
@@ -369,9 +400,24 @@ document.addEventListener('keydown', event => {
 });
 window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', event => { motionPaused = event.matches; plasma.setPaused(motionPaused); updateMotionButton(); });
 function updateClock() { const date = new Date(); $('#clock').textContent = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); $('#date-label').textContent = date.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }); }
+// Theme: follow the saved choice, otherwise the operating system preference.
+const themeButton = $('#theme-toggle');
+function applyTheme(theme) {
+  document.body.classList.toggle('theme-light', theme === 'light');
+  document.documentElement.dataset.theme = theme;
+  const next = theme === 'light' ? 'dark' : 'light';
+  themeButton.setAttribute('aria-label', `Switch to ${next} theme`);
+  themeButton.title = `Switch to ${next} theme`;
+}
+applyTheme(safeStore.get('nyra.theme', window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+themeButton.addEventListener('click', () => {
+  const next = document.body.classList.contains('theme-light') ? 'dark' : 'light';
+  safeStore.set('nyra.theme', next); applyTheme(next);
+});
+
 async function boot() {
   updateClock(); setInterval(updateClock, 10000); updateOutputToggle(); updateMotionButton(); populateVoices(); updateVoiceArmed();
   try { sessionToken = (await api('/api/session')).token; await refresh(); await refreshModels(); if (hasVoiceConsent() && Recognition) { autoStarting = true; window.setTimeout(beginVoice, 500); } } catch { toast('Unable to connect to Nyra. Start the local server and reload.'); }
-  setInterval(refresh, 2200);
+  setInterval(refresh, 1000);
 }
 boot();

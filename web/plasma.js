@@ -50,14 +50,19 @@ window.createNyraPlasma = function createNyraPlasma(canvas, options = {}) {
   }
   function drawBackground() {
     ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, w, h);
+    // Follow the page theme so the field never fights the surrounding surfaces.
+    const styles = getComputedStyle(document.body);
+    const accent = (styles.getPropertyValue('--accent') || '#67e8ff').trim();
+    const light = document.body.classList.contains('theme-light');
+    const [r, g, b] = (accent.match(/[0-9a-f]{2}/gi) || ['67', 'e8', 'ff']).map(hex => parseInt(hex, 16));
     const aura = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius * 2.8);
-    aura.addColorStop(0, '#00689812'); aura.addColorStop(.45, '#00366912'); aura.addColorStop(1, '#00203800'); ctx.fillStyle = aura; ctx.fillRect(0, 0, w, h);
-    stars.forEach(s => { const x = s.x * w + viewX * s.z * 8, y = s.y * h + viewY * s.z * 5; ctx.fillStyle = `rgba(116,186,220,${.12 + s.z * .22})`; ctx.fillRect(x, y, s.r > .94 ? 1.5 : .65, s.r > .94 ? 1.5 : .65); if (s.r > .985) glow(x, y, 12, 0, .25); });
+    aura.addColorStop(0, `rgba(${r},${g},${b},.085)`); aura.addColorStop(.45, `rgba(${r},${g},${b},.05)`); aura.addColorStop(1, `rgba(${r},${g},${b},0)`); ctx.fillStyle = aura; ctx.fillRect(0, 0, w, h);
+    stars.forEach(s => { const x = s.x * w + viewX * s.z * 8, y = s.y * h + viewY * s.z * 5; ctx.fillStyle = light ? `rgba(46,98,124,${.16 + s.z * .3})` : `rgba(116,186,220,${.12 + s.z * .22})`; ctx.fillRect(x, y, s.r > .94 ? 1.5 : .65, s.r > .94 ? 1.5 : .65); if (s.r > .985) glow(x, y, 12, 0, .25); });
     // Thin instrument rings give a stable frame of reference for the rotating volume.
-    ctx.strokeStyle = '#2c91b52d'; ctx.lineWidth = .65;
+    ctx.strokeStyle = light ? 'rgba(30,110,145,.22)' : '#2c91b52d'; ctx.lineWidth = .65;
     for (let ring = 0; ring < 2; ring++) { ctx.beginPath(); ctx.ellipse(cx, cy, radius * (1.42 + ring * .18) * zoom, radius * (.83 + ring * .03) * zoom, -.3 + ring * .8, 0, TAU); ctx.setLineDash(ring ? [2, 11] : []); ctx.stroke(); }
     ctx.setLineDash([]);
-    for (let i = 0; i < 72; i++) { const a = i / 72 * TAU, r = radius * 1.23; const length = i % 6 ? 2 : 6; ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r * zoom, cy + Math.sin(a) * r * zoom); ctx.lineTo(cx + Math.cos(a) * (r + length) * zoom, cy + Math.sin(a) * (r + length) * zoom); ctx.strokeStyle = i % 6 ? '#36769b21' : '#5695b144'; ctx.stroke(); }
+    for (let i = 0; i < 72; i++) { const a = i / 72 * TAU, r = radius * 1.23; const length = i % 6 ? 2 : 6; ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r * zoom, cy + Math.sin(a) * r * zoom); ctx.lineTo(cx + Math.cos(a) * (r + length) * zoom, cy + Math.sin(a) * (r + length) * zoom); ctx.strokeStyle = i % 6 ? (light ? 'rgba(30,110,145,.18)' : '#36769b21') : (light ? 'rgba(30,110,145,.36)' : '#5695b144'); ctx.stroke(); }
   }
   function drawFilaments(front) {
     filaments.forEach((f, index) => {
@@ -143,7 +148,7 @@ window.createNyraPlasma = function createNyraPlasma(canvas, options = {}) {
       const [x, y, z] = placement[i];
       const movement = Math.sin(angle * .65 + i * 1.7) * .14;
       const position = [cx + (x + movement) * radius * (compact ? 1.12 : 1.26), cy + (y + Math.cos(angle * .65 + i) * .08) * radius * 1.12];
-      const inset = compact ? 59 : w < 1000 ? 220 : 280;
+      const inset = compact ? Math.max(node.offsetWidth / 2 + 22, 64) : w < 1000 ? 220 : 280;
       position[0] = bound(position[0], inset, w - inset);
       const anchor = project(x * .58, y * .58, z);
       const active = options.getActivity?.().agent === node.dataset.agent;

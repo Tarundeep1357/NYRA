@@ -27,6 +27,8 @@ GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
 GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
 CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly'
+# Google's loopback redirect: no port is permitted, so Google shows the code on the page for the user to paste.
+CALENDAR_REDIRECT = 'http://localhost'
 WORKSPACE_ROOT = Path(os.environ.get('NYRA_WORKSPACE_ROOT', ROOT)).resolve()
 ACTION_TTL = 300
 LOCAL_RISK = {'low', 'medium', 'high'}  # Anything above "low" requires a spoken or typed OK.
@@ -297,7 +299,7 @@ def connect_calendar_credentials(client_id, client_secret):
     if len(client_secret) <= 14 and client_secret.startswith('AIza'):
         raise ValueError('That looks like a Google API key. Use the OAuth client secret from your OAuth client, not an API key.')
     payload = {'grant_type': 'authorization_code', 'client_id': client_id, 'client_secret': client_secret,
-               'code': 'nyra-connection-check', 'redirect_uri': 'http://localhost'}
+               'code': 'nyra-connection-check', 'redirect_uri': CALENDAR_REDIRECT}
     request = Request(GOOGLE_TOKEN_URL, data=urlencode(payload).encode(),
                       headers={'Content-Type': 'application/x-www-form-urlencoded'})
     try:
@@ -325,7 +327,7 @@ def calendar_authorize(client_id):
     """Build the Google authorization URL for Nyra's loopback-redirect OAuth flow (needs the browser)."""
     if not client_id:
         raise ValueError('Connect your OAuth client credentials first.')
-    params = {'client_id': client_id, 'redirect_uri': 'http://localhost', 'response_type': 'code',
+    params = {'client_id': client_id, 'redirect_uri': CALENDAR_REDIRECT, 'response_type': 'code',
               'scope': CALENDAR_SCOPE, 'access_type': 'offline', 'prompt': 'consent'}
     return 'https://accounts.google.com/o/oauth2/v2/auth?' + urlencode(params)
 
@@ -337,7 +339,7 @@ def calendar_exchange(code):
     if not client_id or not client_secret:
         raise ValueError('Connect your OAuth client credentials first.')
     payload = {'grant_type': 'authorization_code', 'client_id': client_id, 'client_secret': client_secret,
-               'code': code, 'redirect_uri': 'http://localhost'}
+               'code': code, 'redirect_uri': CALENDAR_REDIRECT}
     request = Request(GOOGLE_TOKEN_URL, data=urlencode(payload).encode(),
                       headers={'Content-Type': 'application/x-www-form-urlencoded'})
     try:

@@ -211,6 +211,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(url.startswith('https://accounts.google.com/o/oauth2/v2/auth?'))
         self.assertIn('calendar.readonly', url)
         self.assertIn('redirect_uri=http%3A%2F%2Flocalhost', url)
+        # Google rejects any port in the loopback redirect, and all three OAuth calls must agree.
+        self.assertNotIn('redirect_uri=http%3A%2F%2Flocalhost%3A', url)
+        self.assertEqual(server.CALENDAR_REDIRECT, 'http://localhost')
 
 
 if __name__ == '__main__':
