@@ -31,7 +31,9 @@ function renderState() {
   const tasks = current.tasks, completed = tasks.filter(task => task.done).length;
   $('#task-count').textContent = tasks.length - completed;
   $('#task-progress').textContent = `${completed} complete`;
-  $('#progress-fill').style.width = `${tasks.length ? completed / tasks.length * 100 : 0}%`;
+  const percent = tasks.length ? Math.round(completed / tasks.length * 100) : 0;
+  $('#progress-fill').style.width = `${percent}%`;
+  $('#progress-bar').setAttribute('aria-valuenow', String(percent));
   $('#memory-count').textContent = current.memories.length;
   $('#feedback-count').textContent = current.feedback_count;
   $('#insight').textContent = current.insight;
@@ -47,7 +49,8 @@ function renderState() {
     messageSignature = nextMessages;
     const container = $('#messages');
     const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
-    container.replaceChildren(...current.messages.map(messageNode));
+    const welcome = container.querySelector('.welcome');
+    container.replaceChildren(...(welcome ? [welcome] : []), ...current.messages.map(messageNode));
     if (nearBottom || busy) container.scrollTop = container.scrollHeight;
   }
   $$('.agent, .agent-row').forEach(agent => {
@@ -161,10 +164,10 @@ function renderDetail() {
     const add = dom('button', 'primary-button', 'Add a task +');
     add.addEventListener('click', () => { $('#task-dialog').showModal(); $('#task-input').focus(); });
     content.append(add);
-    if (!current.tasks.length) content.append(dom('p', 'detail-empty', 'No tasks yet. Add a task above or use your voice.'));
+    if (!current.tasks.length) { const empty = dom('div', 'detail-empty'); empty.append(dom('strong', '', 'A clear slate'), document.createTextNode('Add a task above, or just tell Nyra what you want to move forward.')); content.append(empty); }
     current.tasks.forEach(task => content.append(taskRow(task, 'detail-task')));
   } else if (view === 'memory') {
-    content.append(dom('p', 'detail-empty', 'Personal context you choose to save. Memories are included in future model prompts and can be forgotten here.'));
+    if (!current.memories.length) { const empty = dom('div', 'detail-empty'); empty.append(dom('strong', '', 'Nothing saved yet'), document.createTextNode('Say “remember that …” or add one below. Memories become context for future replies and can be forgotten here.')); content.append(empty); }
     const form = dom('form', 'memory-add'); const input = dom('input'); input.setAttribute('aria-label', 'New memory'); input.placeholder = 'Something you want Nyra to remember…'; input.maxLength = 2000; input.required = true;
     const button = dom('button', 'subtle-button', 'Save memory ↗'); button.type = 'submit'; form.append(input, button);
     form.addEventListener('submit', async event => { event.preventDefault(); button.disabled = true; await mutate('/api/memories', { content: input.value }); button.disabled = false; }); content.append(form);
@@ -175,8 +178,19 @@ function renderDetail() {
       current.artifacts.forEach(artifact => { const row = dom('div', 'detail-row'); const link = dom('a', 'text-button', 'Download ↗'); link.href = `/api/artifact/${artifact.id}`; link.download = artifact.name; row.append(dom('p', '', artifact.name), link); content.append(row); });
       content.append(dom('h3', '', 'Agent activity'));
     }
-    if (!current.events.length) content.append(dom('p', 'detail-empty', 'Your agent activity will appear here as Nyra works.'));
-    current.events.forEach(event => { const row = dom('div', 'detail-row'); const text = dom('p', '', `${event.agent.toUpperCase()} · ${event.content}`); const time = dom('time', '', new Date(event.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })); time.dateTime = event.created; row.append(text, time); content.append(row); });
+    if (!current.events.length) { const empty = dom('div', 'detail-empty'); empty.append(dom('strong', '', 'Nothing yet'), document.createTextNode('Your agent activity will appear here as Nyra works.')); content.append(empty); }
+    const timeline = dom('div', 'timeline');
+    current.events.forEach(event => {
+      const row = dom('div', 'detail-row timeline-row');
+      const badge = dom('span', 'timeline-agent', event.agent.toUpperCase());
+      badge.dataset.agent = event.agent;
+      const text = dom('p', '', event.content);
+      const time = dom('time', '', new Date(event.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+      time.dateTime = event.created;
+      row.append(badge, text, time);
+      timeline.append(row);
+    });
+    content.append(timeline);
   }
 }
 window.addEventListener('hashchange', () => { renderDetail(); if (!$('#detail-section').hidden) $('#detail-section .icon-button').focus(); });
