@@ -30,7 +30,7 @@ function renderState() {
   if (wasStreaming) { messageSignature = ''; if (!busy) stopTyping(); }
   const tasks = current.tasks, completed = tasks.filter(task => task.done).length;
   $('#task-count').textContent = tasks.length - completed;
-  $('#task-progress').textContent = `${completed} complete`;
+  $('#task-progress-label').textContent = completed ? `open · ${completed} done` : 'open';
   const percent = tasks.length ? Math.round(completed / tasks.length * 100) : 0;
   $('#progress-fill').style.width = `${percent}%`;
   $('#progress-bar').setAttribute('aria-valuenow', String(percent));
@@ -253,7 +253,7 @@ async function refreshModels() {
     $('#connection-label').textContent = ready ? 'Model connected' : result.connected ? 'Select a model' : 'Connect model';
     $('#connection-dot').classList.toggle('warning', !ready);
     $('#settings-dot').classList.toggle('warning', !result.connected);
-    $('#agent-status').textContent = ready ? '4 specialists · model connected' : '4 specialists · awaiting model';
+    $('#agent-status').textContent = ready ? 'All specialists ready' : result.connected ? 'Pick a model to begin' : 'Awaiting model';
   } catch (error) { toast(error.message); }
 }
 $('#confirm-action').addEventListener('click', () => command('OK', false));
